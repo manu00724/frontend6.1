@@ -8,11 +8,7 @@ import Toasts from "../components/Toast";
 import ENTITY_KEYS from "../config/entityKeys";
 
 const SAMPLE = {
-  processResult: {
-    entities: {},
-    warnings: {},
-    errors: { error_entities: [] }
-  },
+  processResult: { entities: {}, warnings: {}, errors: { error_entities: [] } },
   bgTextHtml: "<p>This is sample BG HTML text.</p><p>Amount: 4750000</p>",
   onerous_clauses: []
 };
@@ -29,7 +25,7 @@ export default function Dashboard() {
 
   const [html, setHtml] = useState(payload.bgTextHtml || "");
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [activeTab, setActiveTab] = useState("entities"); // entities | clauses
+  const [activeTab, setActiveTab] = useState("entities");
 
   const [toasts, setToasts] = useState([]);
   const editorRef = useRef(null);
@@ -45,14 +41,12 @@ export default function Dashboard() {
     setToasts(prev => prev.filter(t => t.id !== id));
   }
 
-  /* Remove previously injected highlight spans (by data-highlight-id) from html state */
+  /* Remove previously injected highlight spans from html state */
   function stripHighlights(inputHtml) {
     return inputHtml.replace(/<span[^>]*data-highlight-id="[^"]*"[^>]*>(.*?)<\/span>/gi, "$1");
   }
 
-  /* Helper: find DOM text node for a given global character offset (in plain text)
-     returns { node, localOffset } or null.
-  */
+  /* Helper: get text node for a global char offset inside root */
   function getNodeForCharacterOffset(root, offset) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
     let node;
@@ -67,91 +61,147 @@ export default function Dashboard() {
     return null;
   }
 
-  /* highlight by computing plain-text index and building Range across nodes */
-  function highlightUsingRange(targetText) {
-    if (!targetText) return;
-    // 1. Clean previous highlights from the html state (so we work on raw DOM)
-    const clean = stripHighlights(html);
-    setHtml(clean);
+  /*
+    Core: find ALL occurrences of targetText (case-insensitive) in the editor's plain text,
+    map them to DOM ranges and wrap each in <span class="bg-highlight" data-highlight-id="...">.
+    After injecting all highlights, we update `html` state from the editor's DOM (so highlights persist).
+    Returns number of matches (integer).
+  */
+  function highlightAllAndSync(targetText) {
+    if (!targetText) return 0;
 
-    // allow editor to update DOM
+    // 1) strip any previous highlight markers from the stored html state
+    const cleanHtml = stripHighlights(html);
+    setHtml(cleanHtml);
+
+    // 2) wait a moment for the editor to reflect the cleaned state
     setTimeout(() => {
-      // locate editor's editable root
-      const editorRoot = document.querySelector(".jodit-wysiwyg") || document.querySelector(".jodit-wysiwyg_iframe");
-      let rootNode = editorRoot;
-      // if jodit is iframe-based, get the iframe body
+      // find editor root (wysiwyg). Try both normal and iframe modes
+      const editorRootEl = document.querySelector(".jodit-wysiwyg") || document.querySelector(".jodit-wysiwyg_iframe");
+      let rootNode = editorRootEl;
       if (!rootNode) {
-        const iframe = document.querySelector(".jodit-wysiwyg_iframe iframe");
-        if (iframe && iframe.contentDocument) rootNode = iframe.contentDocument.body;
+        // fallback: check if iframe wrapper exists
+        const iframeWrapper = document.querySelector(".jodit-wysiwyg_iframe iframe");
+        if (iframeWrapper && iframeWrapper.contentDocument) rootNode = iframeWrapper.contentDocument.body;
       }
+
       if (!rootNode) {
-        pushToast("Editor DOM not found", "error");
+        pushToast("Editor DOM not found for highlighting", "error");
         return;
       }
 
-      // get plain text of the editor (normalized)
+      // get plain text for search (use textContent to preserve what's visible)
       const fullText = rootNode.innerText || rootNode.textContent || "";
-      const normalizedSearch = String(targetText).trim();
+      const search = String(targetText).trim();
+      if (!search) {
+        pushToast("Empty search string", "info");
+        return;
+      }
 
-      // Case-insensitive search on plain text (but preserve original length for range)
-      const index = fullText.toLowerCase().indexOf(normalizedSearch.toLowerCase());
-      if (index === -1) {
+      // build case-insensitive regex; this will find occurrences in the plain text
+      // but we need char indexes in the plain text to map to nodes
+      const lowered = fullText.toLowerCase();
+      const needle = search.toLowerCase();
+
+      // find all start indices of needle in lowered
+      const starts = [];
+      let pos = 0;
+      while (true) {
+        const idx = lowered.indexOf(needle, pos);
+        if (idx === -1) break;
+        starts.push(idx);
+        pos = idx + needle.length;
+      }
+
+      if (starts.length === 0) {
         pushToast(`Not found: "${targetText}"`, "error");
-        // small flash
+        // visual flash
         rootNode.style.boxShadow = "0 0 0 3px rgba(255,165,0,0.12)";
         setTimeout(() => (rootNode.style.boxShadow = ""), 500);
         return;
       }
 
-      const startIndex = index;
-      const endIndex = index + normalizedSearch.length;
-
-      // map start index to node+offset
-      const start = getNodeForCharacterOffset(rootNode, startIndex);
-      const end = getNodeForCharacterOffset(rootNode, endIndex);
-
-      if (!start || !end) {
-        pushToast("Could not map text to DOM nodes for highlighting", "error");
-        return;
+      // To avoid messing indices when we modify the DOM, we'll collect ranges first,
+      // then apply them from last to first (reverse order) so earlier DOM modifications do not shift later offsets.
+      const ranges = [];
+      for (const startIndex of starts) {
+        const endIndex = startIndex + needle.length;
+        const start = getNodeForCharacterOffset(rootNode, startIndex);
+        const end = getNodeForCharacterOffset(rootNode, endIndex);
+        if (start && end) {
+          ranges.push({ start, end });
+        }
       }
 
-      // create a Range from start to end
-      const range = document.createRange();
-      range.setStart(start.node, start.localOffset);
-      // end may be in same or different node: if same node set end, else set end accordingly
-      range.setEnd(end.node, end.localOffset);
-
-      // Extract the contents and wrap them in a highlight span safely (works across nodes)
-      const contents = range.extractContents();
-      const span = document.createElement("span");
-      const uid = "hl-" + Date.now() + "-" + Math.floor(Math.random() * 1000);
-      span.setAttribute("data-highlight-id", uid);
-      span.className = "bg-highlight";
-      span.appendChild(contents);
-      range.insertNode(span);
-
-      // scroll into view
-      setTimeout(() => {
-        const found = rootNode.querySelector(`[data-highlight-id="${uid}"]`);
-        if (found && typeof found.scrollIntoView === "function") {
-          found.scrollIntoView({ behavior: "smooth", block: "center" });
-          found.style.transition = "box-shadow 0.35s";
-          found.style.boxShadow = "0 0 10px rgba(0,0,0,0.2)";
-          setTimeout(() => (found.style.boxShadow = ""), 700);
+      // Apply wraps from last to first
+      let totalWrapped = 0;
+      let firstUid = null;
+      for (let i = ranges.length - 1; i >= 0; i--) {
+        const { start, end } = ranges[i];
+        try {
+          const range = document.createRange();
+          range.setStart(start.node, start.localOffset);
+          range.setEnd(end.node, end.localOffset);
+          // Extract contents and insert span wrapper (safe across nodes)
+          const contents = range.extractContents();
+          const span = document.createElement("span");
+          const uid = "hl-" + Date.now() + "-" + Math.floor(Math.random() * 1000) + "-" + i;
+          span.setAttribute("data-highlight-id", uid);
+          span.className = "bg-highlight";
+          span.appendChild(contents);
+          range.insertNode(span);
+          totalWrapped++;
+          if (!firstUid) firstUid = uid;
+        } catch (err) {
+          // skip invalid ranges silently but continue
+          console.warn("Failed to wrap a range", err);
         }
-      }, 80);
+      }
 
-      pushToast(`Highlighted: "${targetText}"`, "success", 1400);
-    }, 60);
+      // After DOM modifications, sync the editor's innerHTML back to React state so highlights persist
+      // If rootNode is the contentEditable element or body's innerHTML use that
+      // Note: jodit may wrap content into its own structure; using innerHTML is acceptable here.
+      setTimeout(() => {
+        // if we're inside an iframe, serialize the iframe body; otherwise use rootNode.innerHTML
+        let newHtml = "";
+        if (rootNode.ownerDocument && rootNode.ownerDocument !== document) {
+          // in iframe
+          newHtml = rootNode.ownerDocument.body.innerHTML;
+        } else {
+          newHtml = rootNode.innerHTML;
+        }
+        setHtml(newHtml);
+
+        // Scroll to first highlighted element by uid
+        setTimeout(() => {
+          const found = document.querySelector(`[data-highlight-id="${firstUid}"]`);
+          if (found && typeof found.scrollIntoView === "function") {
+            found.scrollIntoView({ behavior: "smooth", block: "center" });
+            found.style.transition = "box-shadow 0.35s";
+            found.style.boxShadow = "0 0 8px rgba(0,0,0,0.18)";
+            setTimeout(() => (found.style.boxShadow = ""), 700);
+          } else {
+            // fallback: search inside the editor root
+            const rootFound = rootNode.querySelector(`[data-highlight-id="${firstUid}"]`);
+            if (rootFound && typeof rootFound.scrollIntoView === "function") {
+              rootFound.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+          }
+        }, 80);
+
+        pushToast(`Highlighted ${totalWrapped} occurrence${totalWrapped > 1 ? "s" : ""}`, "success", 1800);
+      }, 40);
+    }, 50);
+
+    return starts.length;
   }
 
-  // wrappers used by Sidebar
   function onEntityClick(value) {
     if (!value) {
       pushToast("No value to search.", "info", 1800);
       return;
     }
-    highlightUsingRange(String(value));
+    highlightAllAndSync(String(value));
   }
 
   function onClauseClick(text) {
@@ -159,10 +209,10 @@ export default function Dashboard() {
       pushToast("Clause empty", "info", 1800);
       return;
     }
-    highlightUsingRange(text);
+    highlightAllAndSync(text);
   }
 
-  // Layout: use CSS grid so collapsed sidebar never overlays content
+  // Layout grid to avoid distortions on collapse
   const containerStyle = {
     display: "grid",
     gridTemplateColumns: sidebarOpen ? "320px 1fr" : "48px 1fr",
