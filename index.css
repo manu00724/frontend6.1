@@ -1,0 +1,12 @@
+/* highlight style for wrapped matches */
+.bg-highlight {
+  background-color: #fff59d;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+/* ensure editor area doesn't jump when sidebar toggles */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
