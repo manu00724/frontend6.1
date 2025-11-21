@@ -8,9 +8,8 @@ import Toasts from "../components/Toast";
 import ENTITY_KEYS from "../config/entityKeys";
 
 /*
-  Dashboard page
-  - Highlights for entities and onerous clauses use the same HTML-string approach.
-  - The sidebar is controlled via grid layout to avoid editor distortion on collapse.
+  Dashboard page — uses HTML-string highlighting for entities and clauses.
+  Added tolerant fallback for clause matching (allows tags/whitespace between words).
 */
 
 const SAMPLE = {
@@ -53,54 +52,94 @@ export default function Dashboard() {
     return inputHtml.replace(/<span[^>]*data-highlight-id="[^"]*"[^>]*>(.*?)<\/span>/gi, "$1");
   }
 
+  // escape regex special chars
+  const escapeRegExp = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
   /*
-    highlightAllByHtml(targetText)
-    - works on the html state (not walking DOM)
-    - escapes regex-special chars in targetText
-    - highlights ALL non-overlapping matches (case-insensitive)
-    - injects <span class="bg-highlight" data-highlight-id="...">...</span>
-    - updates `html` state with new HTML
-    - scrolls to the first inserted highlight (if present)
-    - shows a toast with how many occurrences were highlighted
+    buildTagTolerantPattern(targetText)
+    - turns "Claim payable on first demand." into a regex pattern that allows
+      HTML tags or whitespace between words. For example between words it uses:
+      (?:\s|<[^>]+>)+
+    - returns a string pattern (not a RegExp object)
   */
-  function highlightAllByHtml(targetText) {
+  function buildTagTolerantPattern(targetText) {
+    // split on whitespace to preserve words
+    const words = String(targetText).trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return "";
+
+    // transform each word to escaped version; allow punctuation in words
+    const parts = words.map(w => escapeRegExp(w));
+    // between words allow either whitespace or HTML tags (one or more)
+    const sep = "(?:\\s|<[^>]+>)+";
+    const pattern = parts.join(sep);
+    return pattern;
+  }
+
+  /*
+    highlightAllByHtmlWithFallback(targetText)
+    - first tries a simple exact-ish regex (case-insensitive)
+    - if not found, tries tag-tolerant pattern (allows tags/whitespace between words)
+    - injects spans, updates html state, scrolls to first highlight, shows toast with count
+  */
+  function highlightAllByHtmlWithFallback(targetText) {
     if (!targetText) return 0;
 
-    // 1. clean old highlights from stored html
+    // 1. clean previous highlights
     const clean = stripHighlights(html);
 
-    // 2. build safe regex
-    const escapeRegExp = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pattern = escapeRegExp(String(targetText).trim());
-    const re = new RegExp(pattern, "gi");
-
-    // 3. test if exists
-    if (!re.test(clean)) {
-      pushToast(`Not found: "${targetText}"`, "error", 3200);
-      // flash editor
-      const editorWrap = document.querySelector(".jodit-wysiwyg") || document.querySelector(".jodit-wysiwyg_iframe");
-      if (editorWrap) {
-        editorWrap.style.boxShadow = "0 0 0 3px rgba(255,165,0,0.12)";
-        setTimeout(() => (editorWrap.style.boxShadow = ""), 500);
-      }
-      return 0;
+    // 2. try the simple direct regex first (fast)
+    const simplePattern = escapeRegExp(String(targetText).trim());
+    const simpleRe = new RegExp(simplePattern, "gi");
+    if (simpleRe.test(clean)) {
+      return applyReplacementAndSync(clean, simpleRe, targetText);
     }
 
-    // 4. Replace all matches with spans (ensure unique ids)
+    // 3. fallback: build tag-tolerant regex (allows HTML tags or whitespace between words)
+    const tolerantPattern = buildTagTolerantPattern(targetText);
+    if (!tolerantPattern) {
+      pushToast("Empty search string", "info");
+      return 0;
+    }
+    const tolerantRe = new RegExp(tolerantPattern, "gi");
+
+    if (tolerantRe.test(clean)) {
+      return applyReplacementAndSync(clean, tolerantRe, targetText);
+    }
+
+    // 4. not found
+    pushToast(`Not found: "${targetText}"`, "error", 3200);
+    // editor flash
+    const editorWrap = document.querySelector(".jodit-wysiwyg") || document.querySelector(".jodit-wysiwyg_iframe");
+    if (editorWrap) {
+      editorWrap.style.boxShadow = "0 0 0 3px rgba(255,165,0,0.12)";
+      setTimeout(() => (editorWrap.style.boxShadow = ""), 500);
+    }
+    return 0;
+  }
+
+  /*
+    applyReplacementAndSync(cleanHtml, re, targetText)
+    - replaces all matches in cleanHtml with highlight spans using `re`
+    - updates html state
+    - scrolls to first highlight and shows count toast
+    - returns number of matches
+  */
+  function applyReplacementAndSync(cleanHtml, re, targetText) {
+    // Replace all matches with spans (ensure unique ids)
     let idx = 0;
     let firstUid = null;
-    const newHtml = clean.replace(re, (m) => {
+    const newHtml = cleanHtml.replace(re, (m) => {
       const uid = `hl-${Date.now()}-${Math.floor(Math.random() * 10000)}-${idx++}`;
       if (!firstUid) firstUid = uid;
       return `<span class="bg-highlight" data-highlight-id="${uid}">${m}</span>`;
     });
 
-    // 5. update state so Jodit shows the highlights
+    // update state so editor shows highlights
     setHtml(newHtml);
 
-    // 6. scroll to first highlight after DOM updates
+    // scroll to first highlight after DOM updates
     setTimeout(() => {
-      // try to find inside editor DOM first
+      // find highlight
       let found = document.querySelector(`[data-highlight-id="${firstUid}"]`);
       if (!found) {
         const editorRoot = document.querySelector(".jodit-wysiwyg") || document.querySelector(".jodit-wysiwyg_iframe");
@@ -125,7 +164,7 @@ export default function Dashboard() {
       pushToast("No value to search.", "info", 1600);
       return;
     }
-    highlightAllByHtml(String(value));
+    highlightAllByHtmlWithFallback(String(value));
   }
 
   function onClauseClick(text) {
@@ -133,7 +172,7 @@ export default function Dashboard() {
       pushToast("Clause empty.", "info", 1600);
       return;
     }
-    highlightAllByHtml(text);
+    highlightAllByHtmlWithFallback(text);
   }
 
   // Layout grid to avoid distortions on collapse
