@@ -1,4 +1,5 @@
 // src/pages/Dashboard.jsx
+//Perfect Dashboard; highlight for onerous also working; just that scroll isn't working
 import React, { useState, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import JoditEditor from "jodit-react";
