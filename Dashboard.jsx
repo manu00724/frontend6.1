@@ -7,6 +7,12 @@ import Sidebar from "../components/Sidebar";
 import Toasts from "../components/Toast";
 import ENTITY_KEYS from "../config/entityKeys";
 
+/*
+  Dashboard page
+  - Highlights for entities and onerous clauses use the same HTML-string approach.
+  - The sidebar is controlled via grid layout to avoid editor distortion on collapse.
+*/
+
 const SAMPLE = {
   processResult: { entities: {}, warnings: {}, errors: { error_entities: [] } },
   bgTextHtml: "<p>This is sample BG HTML text.</p><p>Amount: 4750000</p>",
@@ -25,8 +31,7 @@ export default function Dashboard() {
 
   const [html, setHtml] = useState(payload.bgTextHtml || "");
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [activeTab, setActiveTab] = useState("entities");
-
+  const [activeTab, setActiveTab] = useState("entities"); // 'entities' | 'clauses'
   const [toasts, setToasts] = useState([]);
   const editorRef = useRef(null);
 
@@ -41,175 +46,94 @@ export default function Dashboard() {
     setToasts(prev => prev.filter(t => t.id !== id));
   }
 
-  /* Remove previously injected highlight spans from html state */
+  /* ---- Highlight helpers (HTML string based) ---- */
+
+  // Remove previously injected highlight spans from an HTML string
   function stripHighlights(inputHtml) {
     return inputHtml.replace(/<span[^>]*data-highlight-id="[^"]*"[^>]*>(.*?)<\/span>/gi, "$1");
   }
 
-  /* Helper: get text node for a global char offset inside root */
-  function getNodeForCharacterOffset(root, offset) {
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
-    let node;
-    let count = 0;
-    while ((node = walker.nextNode())) {
-      const len = node.nodeValue.length;
-      if (count + len >= offset) {
-        return { node, localOffset: offset - count };
-      }
-      count += len;
-    }
-    return null;
-  }
-
   /*
-    Core: find ALL occurrences of targetText (case-insensitive) in the editor's plain text,
-    map them to DOM ranges and wrap each in <span class="bg-highlight" data-highlight-id="...">.
-    After injecting all highlights, we update `html` state from the editor's DOM (so highlights persist).
-    Returns number of matches (integer).
+    highlightAllByHtml(targetText)
+    - works on the html state (not walking DOM)
+    - escapes regex-special chars in targetText
+    - highlights ALL non-overlapping matches (case-insensitive)
+    - injects <span class="bg-highlight" data-highlight-id="...">...</span>
+    - updates `html` state with new HTML
+    - scrolls to the first inserted highlight (if present)
+    - shows a toast with how many occurrences were highlighted
   */
-  function highlightAllAndSync(targetText) {
+  function highlightAllByHtml(targetText) {
     if (!targetText) return 0;
 
-    // 1) strip any previous highlight markers from the stored html state
-    const cleanHtml = stripHighlights(html);
-    setHtml(cleanHtml);
+    // 1. clean old highlights from stored html
+    const clean = stripHighlights(html);
 
-    // 2) wait a moment for the editor to reflect the cleaned state
+    // 2. build safe regex
+    const escapeRegExp = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = escapeRegExp(String(targetText).trim());
+    const re = new RegExp(pattern, "gi");
+
+    // 3. test if exists
+    if (!re.test(clean)) {
+      pushToast(`Not found: "${targetText}"`, "error", 3200);
+      // flash editor
+      const editorWrap = document.querySelector(".jodit-wysiwyg") || document.querySelector(".jodit-wysiwyg_iframe");
+      if (editorWrap) {
+        editorWrap.style.boxShadow = "0 0 0 3px rgba(255,165,0,0.12)";
+        setTimeout(() => (editorWrap.style.boxShadow = ""), 500);
+      }
+      return 0;
+    }
+
+    // 4. Replace all matches with spans (ensure unique ids)
+    let idx = 0;
+    let firstUid = null;
+    const newHtml = clean.replace(re, (m) => {
+      const uid = `hl-${Date.now()}-${Math.floor(Math.random() * 10000)}-${idx++}`;
+      if (!firstUid) firstUid = uid;
+      return `<span class="bg-highlight" data-highlight-id="${uid}">${m}</span>`;
+    });
+
+    // 5. update state so Jodit shows the highlights
+    setHtml(newHtml);
+
+    // 6. scroll to first highlight after DOM updates
     setTimeout(() => {
-      // find editor root (wysiwyg). Try both normal and iframe modes
-      const editorRootEl = document.querySelector(".jodit-wysiwyg") || document.querySelector(".jodit-wysiwyg_iframe");
-      let rootNode = editorRootEl;
-      if (!rootNode) {
-        // fallback: check if iframe wrapper exists
-        const iframeWrapper = document.querySelector(".jodit-wysiwyg_iframe iframe");
-        if (iframeWrapper && iframeWrapper.contentDocument) rootNode = iframeWrapper.contentDocument.body;
+      // try to find inside editor DOM first
+      let found = document.querySelector(`[data-highlight-id="${firstUid}"]`);
+      if (!found) {
+        const editorRoot = document.querySelector(".jodit-wysiwyg") || document.querySelector(".jodit-wysiwyg_iframe");
+        if (editorRoot) found = editorRoot.querySelector(`[data-highlight-id="${firstUid}"]`);
       }
-
-      if (!rootNode) {
-        pushToast("Editor DOM not found for highlighting", "error");
-        return;
+      if (found && typeof found.scrollIntoView === "function") {
+        found.scrollIntoView({ behavior: "smooth", block: "center" });
+        found.style.transition = "box-shadow 0.35s";
+        found.style.boxShadow = "0 0 8px rgba(0,0,0,0.15)";
+        setTimeout(() => (found.style.boxShadow = ""), 600);
       }
+      // toast with count
+      pushToast(`Highlighted ${idx} occurrence${idx > 1 ? "s" : ""}`, "success", 1800);
+    }, 120);
 
-      // get plain text for search (use textContent to preserve what's visible)
-      const fullText = rootNode.innerText || rootNode.textContent || "";
-      const search = String(targetText).trim();
-      if (!search) {
-        pushToast("Empty search string", "info");
-        return;
-      }
-
-      // build case-insensitive regex; this will find occurrences in the plain text
-      // but we need char indexes in the plain text to map to nodes
-      const lowered = fullText.toLowerCase();
-      const needle = search.toLowerCase();
-
-      // find all start indices of needle in lowered
-      const starts = [];
-      let pos = 0;
-      while (true) {
-        const idx = lowered.indexOf(needle, pos);
-        if (idx === -1) break;
-        starts.push(idx);
-        pos = idx + needle.length;
-      }
-
-      if (starts.length === 0) {
-        pushToast(`Not found: "${targetText}"`, "error");
-        // visual flash
-        rootNode.style.boxShadow = "0 0 0 3px rgba(255,165,0,0.12)";
-        setTimeout(() => (rootNode.style.boxShadow = ""), 500);
-        return;
-      }
-
-      // To avoid messing indices when we modify the DOM, we'll collect ranges first,
-      // then apply them from last to first (reverse order) so earlier DOM modifications do not shift later offsets.
-      const ranges = [];
-      for (const startIndex of starts) {
-        const endIndex = startIndex + needle.length;
-        const start = getNodeForCharacterOffset(rootNode, startIndex);
-        const end = getNodeForCharacterOffset(rootNode, endIndex);
-        if (start && end) {
-          ranges.push({ start, end });
-        }
-      }
-
-      // Apply wraps from last to first
-      let totalWrapped = 0;
-      let firstUid = null;
-      for (let i = ranges.length - 1; i >= 0; i--) {
-        const { start, end } = ranges[i];
-        try {
-          const range = document.createRange();
-          range.setStart(start.node, start.localOffset);
-          range.setEnd(end.node, end.localOffset);
-          // Extract contents and insert span wrapper (safe across nodes)
-          const contents = range.extractContents();
-          const span = document.createElement("span");
-          const uid = "hl-" + Date.now() + "-" + Math.floor(Math.random() * 1000) + "-" + i;
-          span.setAttribute("data-highlight-id", uid);
-          span.className = "bg-highlight";
-          span.appendChild(contents);
-          range.insertNode(span);
-          totalWrapped++;
-          if (!firstUid) firstUid = uid;
-        } catch (err) {
-          // skip invalid ranges silently but continue
-          console.warn("Failed to wrap a range", err);
-        }
-      }
-
-      // After DOM modifications, sync the editor's innerHTML back to React state so highlights persist
-      // If rootNode is the contentEditable element or body's innerHTML use that
-      // Note: jodit may wrap content into its own structure; using innerHTML is acceptable here.
-      setTimeout(() => {
-        // if we're inside an iframe, serialize the iframe body; otherwise use rootNode.innerHTML
-        let newHtml = "";
-        if (rootNode.ownerDocument && rootNode.ownerDocument !== document) {
-          // in iframe
-          newHtml = rootNode.ownerDocument.body.innerHTML;
-        } else {
-          newHtml = rootNode.innerHTML;
-        }
-        setHtml(newHtml);
-
-        // Scroll to first highlighted element by uid
-        setTimeout(() => {
-          const found = document.querySelector(`[data-highlight-id="${firstUid}"]`);
-          if (found && typeof found.scrollIntoView === "function") {
-            found.scrollIntoView({ behavior: "smooth", block: "center" });
-            found.style.transition = "box-shadow 0.35s";
-            found.style.boxShadow = "0 0 8px rgba(0,0,0,0.18)";
-            setTimeout(() => (found.style.boxShadow = ""), 700);
-          } else {
-            // fallback: search inside the editor root
-            const rootFound = rootNode.querySelector(`[data-highlight-id="${firstUid}"]`);
-            if (rootFound && typeof rootFound.scrollIntoView === "function") {
-              rootFound.scrollIntoView({ behavior: "smooth", block: "center" });
-            }
-          }
-        }, 80);
-
-        pushToast(`Highlighted ${totalWrapped} occurrence${totalWrapped > 1 ? "s" : ""}`, "success", 1800);
-      }, 40);
-    }, 50);
-
-    return starts.length;
+    return idx;
   }
 
+  /* Reuse same highlight behaviour for entities and clauses */
   function onEntityClick(value) {
     if (!value) {
-      pushToast("No value to search.", "info", 1800);
+      pushToast("No value to search.", "info", 1600);
       return;
     }
-    highlightAllAndSync(String(value));
+    highlightAllByHtml(String(value));
   }
 
   function onClauseClick(text) {
     if (!text) {
-      pushToast("Clause empty", "info", 1800);
+      pushToast("Clause empty.", "info", 1600);
       return;
     }
-    highlightAllAndSync(text);
+    highlightAllByHtml(text);
   }
 
   // Layout grid to avoid distortions on collapse
@@ -240,13 +164,30 @@ export default function Dashboard() {
           <div className="flex items-center justify-between mb-3">
             <div className="text-xl font-semibold">BG Editor</div>
             <div>
-              <button onClick={() => setHtml(stripHighlights(html))} className="px-3 py-1 bg-slate-700 text-white rounded">Clear Highlights</button>
-              <button onClick={() => {
-                const full = { ...payload, bgTextHtml: html };
-                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(full, null, 2));
-                const a = document.createElement("a"); a.href = dataStr; a.download = "processResult.json"; a.click();
-              }} className="ml-2 px-3 py-1 bg-green-600 text-white rounded">Download JSON</button>
-              <button onClick={() => navigate("/")} className="ml-2 px-3 py-1 border rounded">Back</button>
+              <button
+                onClick={() => setHtml(stripHighlights(html))}
+                className="px-3 py-1 bg-slate-700 text-white rounded"
+              >
+                Clear Highlights
+              </button>
+
+              <button
+                onClick={() => {
+                  const full = { ...payload, bgTextHtml: html };
+                  const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(full, null, 2));
+                  const a = document.createElement("a");
+                  a.href = dataStr;
+                  a.download = "processResult.json";
+                  a.click();
+                }}
+                className="ml-2 px-3 py-1 bg-green-600 text-white rounded"
+              >
+                Download JSON
+              </button>
+
+              <button onClick={() => navigate("/")} className="ml-2 px-3 py-1 border rounded">
+                Back
+              </button>
             </div>
           </div>
 
