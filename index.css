@@ -10,3 +10,16 @@ html, body, #root {
   height: 100%;
   margin: 0;
 }
+/* new added things */
+/* highlight style */
+.bg-highlight {
+  background-color: #fff59d; /* soft yellow */
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+/* ensure sidebar content scrolls and doesn't overlap */
+aside { box-sizing: border-box; }
+
+/* small tweak to keep editor content from underflowing */
+main { min-height: 0; }
